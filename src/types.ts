@@ -34,6 +34,16 @@ export interface VersionSnapshot {
   terms: TermBinding[];
 }
 
+export interface FieldRecord {
+  code: string;
+  consistent: boolean;
+  measuredWidth: number | null;
+  issues: string;
+  recordedAt: string;
+  targetTextSnapshot: string;
+  sourceTextSnapshot: string;
+}
+
 export interface SignItem {
   id: string;
   code: string;
@@ -47,6 +57,7 @@ export interface SignItem {
   comments: ReviewComment[];
   versions: VersionSnapshot[];
   emergencyRevision: boolean;
+  fieldRecord: FieldRecord | null;
   updatedAt: string;
 }
 

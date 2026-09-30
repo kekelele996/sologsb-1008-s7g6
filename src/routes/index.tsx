@@ -1,11 +1,42 @@
-import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
+import { $, component$, useSignal, useTask$, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
-import { analyzeSign, cloneTerms, diffText } from "../utils";
+import type { FieldRecord, ReviewStatus, SignItem, SignProject } from "../types";
+import { analyzeSign, buildFieldRecordText, cloneTerms, diffText, fieldBlocksConfirmation, fieldIssuesOpen, fieldRecordState, formatRecordedAt, parseFieldRecords, type ParsedFieldBlock } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
+const FIELD_STORAGE_KEY = "sologsb-1008-field-records-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
+
+interface StagedFieldRecord {
+  code: string;
+  consistent: boolean;
+  measuredWidth: number | null;
+  issues: string;
+  recordedAt: string;
+  targetTextSnapshot: string;
+  sourceTextSnapshot: string;
+}
+
+interface ImportOutcome {
+  imported: string[];
+  codeMismatch: Array<{ code: string; raw: string }>;
+  unreadable: Array<{ code: string; reason: string; raw: string }>;
+}
+
+function loadStagedRecords(): Record<string, StagedFieldRecord> {
+  try {
+    const stored = JSON.parse(localStorage.getItem(FIELD_STORAGE_KEY) ?? "") as { schema: number; records: Record<string, StagedFieldRecord> };
+    if (stored.schema === 1 && stored.records) return stored.records;
+  } catch {
+    // No staged records yet.
+  }
+  return {};
+}
+
+function saveStagedRecords(records: Record<string, StagedFieldRecord>) {
+  localStorage.setItem(FIELD_STORAGE_KEY, JSON.stringify({ schema: 1, records }));
+}
 
 export const head: DocumentHead = {
   title: "公共标识多语言校对台",
@@ -38,7 +69,9 @@ export default component$(() => {
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const importOpen = useSignal(false);
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+  const openIssueCount = project.value.signs.filter((sign) => fieldBlocksConfirmation(sign)).length;
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
@@ -75,8 +108,14 @@ export default component$(() => {
   });
 
   const navigateSign = $((direction: 1 | -1) => {
-    if (readOnly.value) return;
     const signs = project.value.signs;
+    if (readOnly.value) {
+      const index = Math.max(0, signs.findIndex((sign) => sign.id === (previewId.value || signs[0].id)));
+      const next = signs[(index + direction + signs.length) % signs.length];
+      previewId.value = next.id;
+      selectedVersionId.value = "";
+      return;
+    }
     const index = Math.max(0, signs.findIndex((sign) => sign.id === project.value.activeSignId));
     const next = signs[(index + direction + signs.length) % signs.length];
     commit("切换标识", (draft) => { draft.activeSignId = next.id; });
@@ -84,6 +123,14 @@ export default component$(() => {
   });
 
   const setStatus = $((status: ReviewStatus) => {
+    const current = project.value.signs.find((item) => item.id === project.value.activeSignId);
+    if (status === "confirmed" && current && fieldBlocksConfirmation(current)) {
+      const state = fieldRecordState(current);
+      toast.value = state === "stale"
+        ? "现场结论已失效（译文已更新），请重新核对后再确认"
+        : "该标识有未处理的现场问题，处理并重新核对后再确认";
+      return;
+    }
     commit("更新审校状态", (draft) => {
       const sign = draft.signs.find((item) => item.id === draft.activeSignId);
       if (!sign) return;
@@ -174,6 +221,37 @@ export default component$(() => {
     toast.value = "只读预览链接已复制";
   });
 
+  const applyImport: QRL<(blocks: ParsedFieldBlock[]) => ImportOutcome> = $((blocks) => {
+    const outcome: ImportOutcome = { imported: [], codeMismatch: [], unreadable: [] };
+    const valid = blocks.filter((block): block is ParsedFieldBlock & { ok: true } => block.ok);
+    const invalid = blocks.filter((block) => !block.ok);
+    commit("导入现场记录", (draft) => {
+      for (const block of valid) {
+        const sign = draft.signs.find((item) => item.code.trim().toLowerCase() === block.code.trim().toLowerCase());
+        if (!sign) {
+          outcome.codeMismatch.push({ code: block.code, raw: block.raw });
+          continue;
+        }
+        sign.fieldRecord = {
+          code: block.code,
+          consistent: block.consistent as boolean,
+          measuredWidth: block.measuredWidth,
+          issues: block.issues,
+          recordedAt: block.recordedAt,
+          targetTextSnapshot: sign.targetText,
+          sourceTextSnapshot: sign.sourceText,
+        };
+        outcome.imported.push(sign.code);
+      }
+    });
+    for (const block of invalid) {
+      outcome.unreadable.push({ code: block.code, reason: block.reason ?? "内容读不了", raw: block.raw });
+    }
+    return outcome;
+  });
+
+  const openImport = $(() => { importOpen.value = true; });
+
   const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value);
   const selectedVersion = () => active().versions.find((version) => version.id === selectedVersionId.value) ?? active().versions[0];
   const comparison = () => {
@@ -248,6 +326,7 @@ export default component$(() => {
   if (readOnly.value) {
     const sign = active();
     const analysis = analyzeSign(sign, previewWidth.value, previewFont.value);
+    const signIndex = Math.max(0, project.value.signs.findIndex((item) => item.id === sign.id));
     return (
       <main data-theme="corporate" class="min-h-screen bg-slate-100 p-6">
         <div class="mx-auto max-w-5xl">
@@ -258,6 +337,13 @@ export default component$(() => {
             </div>
             <span class={`badge ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
           </div>
+
+          <div class="mb-4 flex items-center justify-between rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
+            <button class="btn btn-sm btn-outline" onClick$={() => navigateSign(-1)}>← 上一条</button>
+            <span class="text-xs text-slate-500">第 {signIndex + 1} / {project.value.signs.length} 条 · 键盘 J/K 切换</span>
+            <button class="btn btn-sm btn-outline" onClick$={() => navigateSign(1)}>下一条 →</button>
+          </div>
+
           <section class="rounded-3xl bg-white p-14 shadow-xl">
             <div class="mb-3 text-center text-xs text-slate-400">中文原文</div>
             <p class="mx-auto mb-10 max-w-2xl text-center text-lg text-slate-600">{sign.sourceText}</p>
@@ -266,6 +352,9 @@ export default component$(() => {
             </div>
             <div class="mt-5 text-center text-sm text-slate-500">{sign.targetLanguage} · {sign.regulation}</div>
           </section>
+
+          <FieldCheckPanel key={sign.id} sign={sign} onSaved$={() => { toast.value = "现场记录已保存到本机"; }} onCopied$={() => { toast.value = "现场记录已复制，回工位后粘贴导入"; }} />
+
           <p class="mt-4 text-center text-xs text-slate-400">此链接读取当前浏览器中的本地版本，仅用于演示只读预览。</p>
         </div>
       </main>
@@ -294,6 +383,10 @@ export default component$(() => {
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
+          <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={openImport}>
+            现场记录导入
+            {openIssueCount > 0 && <span class="badge badge-error badge-sm ml-1">{openIssueCount}</span>}
+          </button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
           <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
             {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
@@ -332,6 +425,7 @@ export default component$(() => {
                     <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
                   </div>
                   <div class="mt-2 line-clamp-2 text-sm font-semibold text-slate-700">{sign.sourceText}</div>
+                  <FieldBadge sign={sign} />
                   <div class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
                     <span>{sign.targetLanguage}</span>
                     <span class={risk.risk === "high" ? "font-bold text-error" : risk.risk === "medium" ? "font-bold text-warning" : "text-success"}>
@@ -423,6 +517,8 @@ export default component$(() => {
                 </div>
               </div>
             </section>
+
+            <FieldRecordCard sign={active()} onImport$={openImport} />
 
             <section class="card border border-slate-200 bg-white shadow-sm">
               <div class="card-body p-5">
@@ -552,7 +648,272 @@ export default component$(() => {
         </aside>
       </div>
 
+      <ImportModal open={importOpen.value} onClose$={() => { importOpen.value = false; }} onImport$={applyImport} />
+
       {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
+    </div>
+  );
+});
+
+const FieldBadge = component$<{ sign: SignItem }>((props) => {
+  const state = fieldRecordState(props.sign);
+  if (state === "none") return <span class="badge badge-ghost badge-sm mt-2">未核对</span>;
+  if (state === "stale") return <span class="badge badge-warning badge-sm mt-2">现场结论待重新确认</span>;
+  if (fieldIssuesOpen(props.sign)) return <span class="badge badge-error badge-sm mt-2">现场问题待处理</span>;
+  return <span class="badge badge-success badge-sm mt-2">现场已核对</span>;
+});
+
+const FieldRecordCard = component$<{ sign: SignItem; onImport$: QRL<() => void> }>((props) => {
+  const record = props.sign.fieldRecord;
+  const state = fieldRecordState(props.sign);
+  const issuesOpen = record ? fieldIssuesOpen(props.sign) : false;
+  return (
+    <section class="card border border-slate-200 bg-white shadow-sm">
+      <div class="card-body gap-4 p-5">
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-500">Field check</div>
+            <h2 class="font-bold">现场核对记录</h2>
+          </div>
+          <div class="flex items-center gap-2">
+            {state === "stale" && <span class="badge badge-warning">待重新确认</span>}
+            {state === "valid" && issuesOpen && <span class="badge badge-error">有未处理问题</span>}
+            {state === "valid" && !issuesOpen && <span class="badge badge-success">已核对</span>}
+            {state === "none" && <span class="badge badge-ghost">未核对</span>}
+            <button class="btn btn-sm btn-outline" onClick$={() => props.onImport$()}>导入现场记录</button>
+          </div>
+        </div>
+
+        {state === "none" ? (
+          <div class="rounded-xl border border-dashed p-5 text-center text-xs text-slate-400">
+            暂无现场记录。巡检员在只读预览页核对每条标识后，把记录粘贴到这里导入，按编号一条条对账。
+          </div>
+        ) : (
+          <>
+            {state === "stale" && (
+              <div class="alert alert-warning py-2 text-xs">
+                <span>译文已更新，之前的现场结论已失效，需重新核对后再确认。</span>
+              </div>
+            )}
+            {state === "valid" && issuesOpen && (
+              <div class="alert alert-error py-2 text-xs">
+                <span>该标识有未处理的现场问题，处理并重新核对前不能标记为已确认。</span>
+              </div>
+            )}
+            <div class="grid gap-3 text-sm md:grid-cols-2">
+              <div class="rounded-lg bg-slate-50 p-3">
+                <div class="text-xs text-slate-400">实物与稿子</div>
+                <div class={`mt-1 font-bold ${record!.consistent ? "text-success" : "text-error"}`}>{record!.consistent ? "一致" : "不一致"}</div>
+              </div>
+              <div class="rounded-lg bg-slate-50 p-3">
+                <div class="text-xs text-slate-400">现场量到的可用宽度</div>
+                <div class="mt-1 font-bold">{record!.measuredWidth == null ? "未量到" : `${record!.measuredWidth} px`}</div>
+              </div>
+            </div>
+            <div class="rounded-lg bg-slate-50 p-3 text-sm">
+              <div class="text-xs text-slate-400">具体问题</div>
+              <div class="mt-1 whitespace-pre-line">{record!.issues.trim() || "无"}</div>
+            </div>
+            <div class="text-xs text-slate-400">记录时间：{formatRecordedAt(record!.recordedAt)}</div>
+          </>
+        )}
+      </div>
+    </section>
+  );
+});
+
+const FieldCheckPanel = component$<{ sign: SignItem; onSaved$: QRL<() => void>; onCopied$: QRL<() => void> }>((props) => {
+  const consistent = useSignal<boolean | null>(null);
+  const width = useSignal("");
+  const issues = useSignal("");
+  const savedAt = useSignal("");
+  const stagedSnapshot = useSignal("");
+  const staged = useSignal<StagedFieldRecord | null>(null);
+
+  useTask$(({ track }) => {
+    track(() => props.sign.id);
+    const records = loadStagedRecords();
+    const record = records[props.sign.code];
+    if (record) {
+      consistent.value = record.consistent;
+      width.value = record.measuredWidth == null ? "" : String(record.measuredWidth);
+      issues.value = record.issues;
+      savedAt.value = record.recordedAt;
+      stagedSnapshot.value = record.targetTextSnapshot;
+      staged.value = record;
+    } else {
+      consistent.value = null;
+      width.value = "";
+      issues.value = "";
+      savedAt.value = "";
+      stagedSnapshot.value = "";
+      staged.value = null;
+    }
+  });
+
+  const stale = stagedSnapshot.value !== "" && stagedSnapshot.value !== props.sign.targetText;
+  const issuesRequired = consistent.value === false && issues.value.trim() === "";
+  const canSave = consistent.value !== null && !issuesRequired;
+
+  const save = $(() => {
+    if (consistent.value === null) return;
+    const records = loadStagedRecords();
+    const measuredWidth = width.value.trim() === "" ? null : Number(width.value);
+    const record: StagedFieldRecord = {
+      code: props.sign.code,
+      consistent: consistent.value,
+      measuredWidth: Number.isFinite(measuredWidth) ? measuredWidth : null,
+      issues: issues.value.trim(),
+      recordedAt: new Date().toISOString(),
+      targetTextSnapshot: props.sign.targetText,
+      sourceTextSnapshot: props.sign.sourceText,
+    };
+    records[props.sign.code] = record;
+    saveStagedRecords(records);
+    savedAt.value = record.recordedAt;
+    stagedSnapshot.value = record.targetTextSnapshot;
+    staged.value = record;
+    void props.onSaved$();
+  });
+
+  const copy = $(() => {
+    const records = loadStagedRecords();
+    const list = Object.values(records).map((record) => ({
+      code: record.code,
+      consistent: record.consistent,
+      measuredWidth: record.measuredWidth,
+      issues: record.issues,
+      recordedAt: record.recordedAt,
+    }));
+    if (!list.length) return;
+    const text = buildFieldRecordText(list);
+    void navigator.clipboard?.writeText(text).then(() => props.onCopied$()).catch(() => undefined);
+  });
+
+  return (
+    <section class="mt-6 rounded-3xl bg-white p-8 shadow-xl">
+      <div class="mb-4 flex items-center justify-between">
+        <div>
+          <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-500">Field check</div>
+          <h2 class="text-xl font-bold">现场核对记录</h2>
+          <p class="mt-1 text-xs text-slate-500">核对实物与稿子是否一致，记录现场量到的可用宽度和具体问题。无网络时先保存在本机。</p>
+        </div>
+        {staged.value && <span class="badge badge-outline">已保存在本机</span>}
+      </div>
+
+      {stale && (
+        <div class="alert alert-warning mb-4 py-2 text-xs">
+          <span>译文已更新，之前的核对结果可能失效，建议重新核对后再保存。</span>
+        </div>
+      )}
+
+      <div class="grid gap-4 md:grid-cols-2">
+        <div>
+          <span class="label-text mb-1 text-xs font-bold text-slate-500">实物与稿子是否一致</span>
+          <div class="join w-full">
+            <button class={`btn join-item flex-1 ${consistent.value === true ? "btn-success" : "btn-outline"}`} onClick$={() => { consistent.value = true; }}>一致</button>
+            <button class={`btn join-item flex-1 ${consistent.value === false ? "btn-error" : "btn-outline"}`} onClick$={() => { consistent.value = false; }}>不一致</button>
+          </div>
+        </div>
+        <label class="form-control">
+          <span class="label-text mb-1 text-xs font-bold text-slate-500">现场量到的可用宽度 (px)</span>
+          <input type="number" min="0" class="input input-bordered" placeholder="例如 470；未量到留空" value={width.value} onInput$={(_, element) => { width.value = element.value; }} />
+        </label>
+      </div>
+
+      <label class="form-control mt-4">
+        <span class="label-text mb-1 text-xs font-bold text-slate-500">
+          具体问题 {consistent.value === false && <span class="text-error">（不一致时必填）</span>}
+        </span>
+        <textarea
+          class="textarea textarea-bordered min-h-24"
+          placeholder="记录实物与稿子不符之处、宽度偏差、安装环境问题…"
+          value={issues.value}
+          onInput$={(_, element) => { issues.value = element.value; }}
+        />
+      </label>
+
+      <div class="mt-4 flex items-center gap-3">
+        <button class="btn btn-primary" disabled={!canSave} onClick$={save}>保存到本机</button>
+        <button class="btn btn-outline" onClick$={copy}>复制现场记录</button>
+        {savedAt.value && <span class="text-xs text-slate-400">已于 {formatRecordedAt(savedAt.value)} 保存</span>}
+      </div>
+    </section>
+  );
+});
+
+const ImportModal = component$<{
+  open: boolean;
+  onClose$: QRL<() => void>;
+  onImport$: QRL<(blocks: ParsedFieldBlock[]) => ImportOutcome>;
+}>((props) => {
+  const text = useSignal("");
+  const outcome = useSignal<ImportOutcome | null>(null);
+
+  useTask$(({ track }) => {
+    track(() => props.open);
+    if (props.open) {
+      text.value = "";
+      outcome.value = null;
+    }
+  });
+
+  const doImport = $(async () => {
+    const blocks = parseFieldRecords(text.value);
+    if (!blocks.length) {
+      outcome.value = { imported: [], codeMismatch: [], unreadable: [{ code: "", reason: "未读到可导入的内容", raw: text.value }] };
+      return;
+    }
+    const result = await props.onImport$(blocks);
+    outcome.value = result;
+  });
+
+  const hasFailure = (outcome.value?.codeMismatch.length ?? 0) + (outcome.value?.unreadable.length ?? 0) > 0;
+
+  return (
+    <div class={`modal ${props.open ? "modal-open" : ""}`}>
+      <div class="modal-box max-w-2xl">
+        <h3 class="text-lg font-bold">导入现场记录</h3>
+        <p class="py-2 text-xs leading-5 text-slate-500">
+          把巡检员在只读预览页复制的现场记录粘贴到下方，按标识编号一条条对账。编号对不上或内容读不了的会原样留着，可修改后重试；已有译文和意见不受影响。
+        </p>
+        <textarea
+          class="textarea textarea-bordered min-h-40 w-full font-mono text-xs"
+          placeholder="粘贴现场记录文本…"
+          value={text.value}
+          onInput$={(_, element) => { text.value = element.value; }}
+        />
+
+        {outcome.value && (
+          <div class="mt-3 space-y-2 text-xs">
+            {outcome.value.imported.length > 0 && (
+              <div class="rounded-lg border border-success/40 bg-success/10 p-2">
+                <strong class="text-success">已导入 {outcome.value.imported.length} 条：</strong>
+                <span class="ml-1">{outcome.value.imported.join("、")}</span>
+              </div>
+            )}
+            {outcome.value.codeMismatch.map((item, index) => (
+              <div key={`m-${index}`} class="rounded-lg border border-warning/40 bg-warning/10 p-2">
+                <strong class="text-warning">编号对不上：{item.code || "（空）"}</strong>
+                <span class="ml-1 text-slate-500">工作台里找不到这个编号，已原样留着，可改后重试。</span>
+              </div>
+            ))}
+            {outcome.value.unreadable.map((item, index) => (
+              <div key={`u-${index}`} class="rounded-lg border border-error/40 bg-error/10 p-2">
+                <strong class="text-error">内容读不了{`：${item.reason}`}</strong>
+                <span class="ml-1 text-slate-500">已原样留着，可修改后重试。</span>
+              </div>
+            ))}
+            {hasFailure && <div class="text-slate-400">失败的记录没有改动任何译文和意见，改完点“导入”重试即可。</div>}
+          </div>
+        )}
+
+        <div class="modal-action">
+          <button class="btn btn-ghost" onClick$={() => props.onClose$()}>关闭</button>
+          <button class="btn btn-primary" disabled={!text.value.trim()} onClick$={doImport}>导入</button>
+        </div>
+      </div>
+      <div class="modal-backdrop" onClick$={() => props.onClose$()}></div>
     </div>
   );
 });
